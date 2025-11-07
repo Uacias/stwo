@@ -1,4 +1,7 @@
 //! AIR for Poseidon2 hash function from <https://eprint.iacr.org/2023/323.pdf>.
+//!
+//! **CUSTOM VERSION**: This version accepts custom input states instead of auto-generating them.
+//! Use this when you want to hash your own specific data.
 
 use std::ops::{Add, AddAssign, Mul, Sub};
 
@@ -202,14 +205,44 @@ pub struct LookupData {
     pub initial_state: [[BaseColumn; N_STATE]; N_INSTANCES_PER_ROW],
     pub final_state: [[BaseColumn; N_STATE]; N_INSTANCES_PER_ROW],
 }
+/// Generate trace with custom input states.
+///
+/// # Parameters
+/// - `log_size`: log2(number of rows in the trace)
+/// - `custom_inputs`: Vector of 16-element states to hash. Length must equal (1 << log_size) *
+///   N_INSTANCES_PER_ROW.
+///
+/// # Example
+/// ```ignore
+/// let inputs = vec![
+///     [BaseField::from(1), BaseField::from(2), ..., BaseField::from(16)],  // Hash #1
+///     [BaseField::from(100), BaseField::from(200), ..., BaseField::from(1600)],  // Hash #2
+///     // ... more hashes
+/// ];
+/// let (trace, lookup_data) = gen_trace(log_size, inputs);
+/// ```
 pub fn gen_trace(
     log_size: u32,
+    custom_inputs: Vec<[BaseField; N_STATE]>,
 ) -> (
     ColumnVec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>,
     LookupData,
 ) {
     let _span = span!(Level::INFO, "Generation").entered();
     assert!(log_size >= LOG_N_LANES);
+
+    // Validate input length
+    let expected_n_instances = (1 << log_size) * N_INSTANCES_PER_ROW;
+    assert_eq!(
+        custom_inputs.len(),
+        expected_n_instances,
+        "Expected {} input states (2^{} rows * {} instances per row), got {}",
+        expected_n_instances,
+        log_size,
+        N_INSTANCES_PER_ROW,
+        custom_inputs.len()
+    );
+
     let mut trace = (0..N_COLUMNS)
         .map(|_| Col::<SimdBackend, BaseField>::zeros(1 << log_size))
         .collect_vec();
@@ -226,9 +259,15 @@ pub fn gen_trace(
         // Initial state.
         let mut col_index = 0;
         for rep_i in 0..N_INSTANCES_PER_ROW {
+            // Use custom input instead of auto-generation
             let mut state: [_; N_STATE] = std::array::from_fn(|state_i| {
-                PackedBaseField::from_array(std::array::from_fn(|i| {
-                    BaseField::from_u32_unchecked((vec_index * 16 + i + state_i + rep_i) as u32)
+                PackedBaseField::from_array(std::array::from_fn(|lane_i| {
+                    // Calculate the global instance index
+                    // Each vec_index contains (1 << LOG_N_LANES) rows packed in SIMD
+                    // Each row contains N_INSTANCES_PER_ROW instances
+                    let physical_row = vec_index * (1 << LOG_N_LANES) + lane_i;
+                    let instance_index = physical_row * N_INSTANCES_PER_ROW + rep_i;
+                    custom_inputs[instance_index][state_i]
                 }))
             });
             state.iter().copied().for_each(|s| {
@@ -329,10 +368,24 @@ pub fn gen_interaction_trace(
     logup_gen.finalize_last()
 }
 
+/// Prove Poseidon hash computations with custom input states.
+///
+/// # Parameters
+/// - `custom_inputs`: Vector of 16-element states to hash
+/// - `config`: PCS configuration for the proof
+///
+/// The function will automatically calculate `log_n_instances` from the input length.
 pub fn prove_poseidon(
-    log_n_instances: u32,
+    custom_inputs: Vec<[BaseField; N_STATE]>,
     config: PcsConfig,
 ) -> (PoseidonComponent, StarkProof<Blake2sMerkleHasher>) {
+    let n_instances = custom_inputs.len();
+    assert!(
+        n_instances > 0 && n_instances.is_power_of_two(),
+        "Number of inputs must be a power of 2, got {}",
+        n_instances
+    );
+    let log_n_instances = (n_instances as f64).log2() as u32;
     assert!(log_n_instances >= N_LOG_INSTANCES_PER_ROW as u32);
     let log_n_rows = log_n_instances - N_LOG_INSTANCES_PER_ROW as u32;
 
@@ -360,7 +413,7 @@ pub fn prove_poseidon(
 
     // Trace.
     let span = span!(Level::INFO, "Trace").entered();
-    let (trace, lookup_data) = gen_trace(log_n_rows);
+    let (trace, lookup_data) = gen_trace(log_n_rows, custom_inputs);
     let mut tree_builder = commitment_scheme.tree_builder();
     tree_builder.extend_evals(trace);
     tree_builder.commit(channel);
@@ -408,7 +461,8 @@ mod tests {
     use stwo::core::verifier::verify;
     use stwo_constraint_framework::assert_constraints_on_polys;
 
-    use crate::poseidon::{
+    use super::*;
+    use crate::poseidon_custom::{
         apply_internal_round_matrix, apply_m4, eval_poseidon_constraints, gen_interaction_trace,
         gen_trace, prove_poseidon, PoseidonElements,
     };
@@ -417,13 +471,20 @@ mod tests {
     #[wasm_bindgen_test::wasm_bindgen_test]
     fn test_poseidon_prove_wasm() {
         const LOG_N_INSTANCES: u32 = 10;
+        let n_instances = 1 << LOG_N_INSTANCES;
+
+        // Generate custom inputs
+        let custom_inputs: Vec<[BaseField; N_STATE]> = (0..n_instances)
+            .map(|i| std::array::from_fn(|j| BaseField::from((i * 16 + j) as u32)))
+            .collect();
+
         let config = PcsConfig {
             pow_bits: 10,
             fri_config: FriConfig::new(5, 1, 64),
         };
 
         // Prove.
-        prove_poseidon(LOG_N_INSTANCES, config);
+        prove_poseidon(custom_inputs, config);
     }
 
     #[test]
@@ -466,9 +527,15 @@ mod tests {
     #[test]
     fn test_poseidon_constraints() {
         const LOG_N_ROWS: u32 = 8;
+        let n_instances = (1 << LOG_N_ROWS) * N_INSTANCES_PER_ROW;
+
+        // Generate custom inputs
+        let custom_inputs: Vec<[BaseField; N_STATE]> = (0..n_instances)
+            .map(|i| std::array::from_fn(|j| BaseField::from((i * 16 + j) as u32)))
+            .collect();
 
         // Trace.
-        let (trace0, interaction_data) = gen_trace(LOG_N_ROWS);
+        let (trace0, interaction_data) = gen_trace(LOG_N_ROWS, custom_inputs);
         let lookup_elements = PoseidonElements::dummy();
         let (trace1, claimed_sum) =
             gen_interaction_trace(LOG_N_ROWS, interaction_data, &lookup_elements);
@@ -498,13 +565,20 @@ mod tests {
             .unwrap_or_else(|_| "10".to_string())
             .parse::<u32>()
             .unwrap();
+        let n_instances = 1 << log_n_instances;
+
+        // Generate custom inputs
+        let custom_inputs: Vec<[BaseField; N_STATE]> = (0..n_instances)
+            .map(|i| std::array::from_fn(|j| BaseField::from((i * 16 + j) as u32)))
+            .collect();
+
         let config = PcsConfig {
             pow_bits: 10,
             fri_config: FriConfig::new(5, 1, 64),
         };
 
         // Prove.
-        let (component, proof) = prove_poseidon(log_n_instances, config);
+        let (component, proof) = prove_poseidon(custom_inputs, config);
 
         // Verify.
         // TODO: Create Air instance independently.
@@ -545,16 +619,101 @@ mod tests {
             .unwrap_or_else(|_| "10".to_string())
             .parse::<u32>()
             .unwrap();
+        let n_instances = 1 << log_n_instances;
+
+        // Generate custom inputs
+        let custom_inputs: Vec<[BaseField; N_STATE]> = (0..n_instances)
+            .map(|i| std::array::from_fn(|j| BaseField::from((i * 16 + j) as u32)))
+            .collect();
+
         let config = PcsConfig {
             pow_bits: 10,
             fri_config: FriConfig::new(5, 1, 64),
         };
 
         // Prove.
-        let _ = prove_poseidon(log_n_instances, config);
+        let _ = prove_poseidon(custom_inputs, config);
 
         let csv = collector.export_csv();
 
         println!("{csv}");
+    }
+
+    /// Example test showing how to use custom inputs
+    #[test]
+    fn test_custom_inputs_example() {
+        println!("\n=== Custom Inputs Example ===\n");
+
+        // LOG_N_LANES is typically 4, so we need at least 2^4 = 16 rows
+        // Each row has 8 instances, so we need 16 * 8 = 128 inputs total
+        let log_size = LOG_N_LANES;
+        let n_instances = (1 << log_size) * N_INSTANCES_PER_ROW;
+
+        // Define your own custom inputs to hash
+        let mut my_inputs = vec![
+            // Hash #1: All ones
+            [BaseField::from(1); N_STATE],
+            // Hash #2: Sequential 1,2,3,...,16
+            std::array::from_fn(|i| BaseField::from((i + 1) as u32)),
+            // Hash #3: All 100s
+            [BaseField::from(100); N_STATE],
+            // Hash #4: Powers of 2
+            std::array::from_fn(|i| BaseField::from(1u32 << i)),
+            // Hash #5: All 42s
+            [BaseField::from(42); N_STATE],
+            // Hash #6: Fibonacci-ish
+            std::array::from_fn(|i| BaseField::from((i * i) as u32)),
+            // Hash #7: All 777s
+            [BaseField::from(777); N_STATE],
+            // Hash #8: Descending
+            std::array::from_fn(|i| BaseField::from((16 - i) as u32)),
+        ];
+
+        // Fill remaining inputs to meet required count
+        for i in my_inputs.len()..n_instances {
+            my_inputs.push(std::array::from_fn(|j| {
+                BaseField::from((i * 16 + j) as u32)
+            }));
+        }
+
+        println!("Hashing {} custom input states", my_inputs.len());
+        println!("(First 8 are custom, rest are auto-filled)\n");
+        println!("First input (all 1s):");
+        println!("  {:?}", my_inputs[0]);
+        println!("\nSecond input (sequential 1-16):");
+        println!("  {:?}\n", my_inputs[1]);
+
+        // Generate trace with custom inputs
+        let (trace, lookup_data) = gen_trace(log_size, my_inputs.clone());
+
+        println!("Trace generated with {} columns", trace.len());
+        println!(
+            "Each row contains {} Poseidon instances\n",
+            N_INSTANCES_PER_ROW
+        );
+
+        // Verify first output
+        println!("Output of first hash (input was all 1s):");
+        print!("  [");
+        for i in 0..N_STATE {
+            print!("{}", lookup_data.final_state[0][i].at(0));
+            if i < N_STATE - 1 {
+                print!(", ");
+            }
+        }
+        println!("]\n");
+
+        println!("Output of second hash (input was 1,2,3,...,16):");
+        print!("  [");
+        for i in 0..N_STATE {
+            print!("{}", lookup_data.final_state[1][i].at(0));
+            if i < N_STATE - 1 {
+                print!(", ");
+            }
+        }
+        println!("]\n");
+
+        println!("✓ Successfully hashed custom inputs!");
+        println!("\n=== Example Complete ===");
     }
 }
