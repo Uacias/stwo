@@ -811,4 +811,78 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn test_different_log_sizes_experiment() {
+        println!("\n==================================================");
+        println!("  EXPERIMENT: DIFFERENT LOG_SIZES PER COMPONENT");
+        println!("==================================================\n");
+
+        let n_messages_comp1 = 3;   // Needs log_size = 2 (4 rows min) or 4 (16 rows for SIMD)
+        let n_messages_comp2 = 50;  // Needs log_size = 6 (64 rows)
+
+        println!("Computing1: {} messages → log_size = 4 (16 rows)", n_messages_comp1);
+        println!("Computing2: {} messages → log_size = 6 (64 rows)", n_messages_comp2);
+        println!("\nTrying to use DIFFERENT log_sizes...\n");
+
+        // Create test messages
+        let messages_comp1: Vec<[BaseField; RATE]> = (0..n_messages_comp1)
+            .map(|i| std::array::from_fn(|j| BaseField::from_u32_unchecked((i * RATE + j) as u32)))
+            .collect();
+
+        let messages_comp2: Vec<[BaseField; RATE]> = (0..n_messages_comp2)
+            .map(|i| std::array::from_fn(|j| BaseField::from_u32_unchecked((i * RATE + j + 100) as u32)))
+            .collect();
+
+        let config = PcsConfig::default();
+
+        // EXPERIMENT: Try different log_sizes
+        let log_size_comp1 = 4;  // 16 rows for Computing1
+        let log_size_comp2 = 6;  // 64 rows for Computing2
+        let log_size_scheduler = log_size_comp2.max(log_size_comp1);  // Use max for scheduler
+
+        println!("Generating traces with DIFFERENT log_sizes:");
+        println!("  - Computing1 trace: log_size = {} ({} rows)", log_size_comp1, 1 << log_size_comp1);
+        println!("  - Computing2 trace: log_size = {} ({} rows)", log_size_comp2, 1 << log_size_comp2);
+        println!("  - Scheduler trace: log_size = {} ({} rows)", log_size_scheduler, 1 << log_size_scheduler);
+
+        // Generate traces with DIFFERENT log_sizes
+        let (trace_computing1, final_state1) = gen_poseidon_computing_trace(log_size_comp1, n_messages_comp1, messages_comp1);
+        let (trace_computing2, final_state2) = gen_poseidon_computing_trace(log_size_comp2, n_messages_comp2, messages_comp2);
+        let trace_scheduler = gen_poseidon_scheduler_trace(log_size_scheduler, final_state1, final_state2);
+
+        println!("\n✅ Traces generated successfully with different sizes!");
+        println!("  - Computing1: {} columns x {} rows", trace_computing1.len(), 1 << log_size_comp1);
+        println!("  - Computing2: {} columns x {} rows", trace_computing2.len(), 1 << log_size_comp2);
+        println!("  - Scheduler: {} columns x {} rows", trace_scheduler.len(), 1 << log_size_scheduler);
+
+        // Now try to commit them to Merkle tree
+        println!("\nNow trying to commit to Merkle tree...");
+
+        let twiddles = SimdBackend::precompute_twiddles(
+            CanonicCoset::new(log_size_scheduler + LOG_EXPAND + config.fri_config.log_blowup_factor)
+                .circle_domain()
+                .half_coset,
+        );
+
+        let channel = &mut Blake2sChannel::default();
+        let mut commitment_scheme = CommitmentSchemeProver::<SimdBackend, Blake2sMerkleChannel>::new(
+            config,
+            &twiddles,
+        );
+
+        let mut tree_builder = commitment_scheme.tree_builder();
+
+        println!("Attempting to extend_evals with DIFFERENT sized traces...");
+        // This will likely FAIL because all columns in a tree must have same size!
+        tree_builder.extend_evals([trace_computing1, trace_computing2, trace_scheduler].concat());
+
+        println!("✅ extend_evals succeeded!");
+
+        // Try to commit
+        println!("Attempting to commit...");
+        tree_builder.commit(channel);
+
+        println!("✅✅✅ COMMIT SUCCEEDED! Different log_sizes work!");
+    }
 }
