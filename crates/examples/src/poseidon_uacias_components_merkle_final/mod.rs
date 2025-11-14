@@ -394,7 +394,7 @@ impl MerkleStatement1 {
 pub fn prove_merkle(
     depth: usize,
     leaf: [BaseField; RATE],
-    siblings: Vec<[BaseField; RATE]>,
+    siblings: Vec<[BaseField; N_STATE]>, // Changed: siblings now 16 elements (rate + capacity)
     index: u32,
     expected_root: [BaseField; RATE],
     channel: &mut Blake2sChannel,
@@ -678,7 +678,11 @@ mod tests {
 
         // First, let's actually compute a proper Merkle path using SPONGE construction
         // We'll use a helper to hash two nodes with sequential absorption
-        fn hash_two_nodes(left: [BaseField; RATE], right: [BaseField; RATE]) -> [BaseField; RATE] {
+        // CHANGED: Now returns full state (16 elements) including capacity
+        fn hash_two_nodes(
+            left: [BaseField; RATE],
+            right: [BaseField; RATE],
+        ) -> [BaseField; N_STATE] {
             use super::{
                 apply_external_round_matrix, apply_internal_round_matrix, pow5,
                 EXTERNAL_ROUND_CONSTS, INTERNAL_ROUND_CONSTS, N_HALF_FULL_ROUNDS, N_PARTIAL_ROUNDS,
@@ -749,10 +753,8 @@ mod tests {
                 state = std::array::from_fn(|i| pow5(state[i]));
             }
 
-            // Return rate part of final state
-            let mut result = [BaseField::from_u32_unchecked(0); RATE];
-            result.copy_from_slice(&state[0..RATE]);
-            result
+            // Return FULL state (rate + capacity) - 16 elements
+            state
         }
 
         // Build a full tree with 8 leaves
@@ -767,14 +769,22 @@ mod tests {
         let mut siblings = Vec::new();
         let mut current_index = leaf_index;
 
-        // Level 0: leaves
+        // Level 0: leaves (need to convert 8-elem leaves to 16-elem with capacity=0)
         let level0 = leaves.clone();
         let sibling0_index = if current_index % 2 == 0 {
             current_index + 1
         } else {
             current_index - 1
         };
-        siblings.push(level0[sibling0_index]);
+        // Convert leaf (8 elem) to full state (16 elem) with capacity=0
+        let sibling0_full: [BaseField; N_STATE] = std::array::from_fn(|i| {
+            if i < RATE {
+                level0[sibling0_index][i]
+            } else {
+                BaseField::from_u32_unchecked(0) // capacity = 0 for leaves
+            }
+        });
+        siblings.push(sibling0_full);
         let _parent0 = if current_index % 2 == 0 {
             hash_two_nodes(level0[current_index], level0[sibling0_index])
         } else {
@@ -782,42 +792,50 @@ mod tests {
         };
         current_index /= 2;
 
-        // Level 1: 4 nodes
-        let mut level1 = Vec::new();
+        // Level 1: 4 nodes (now full 16-elem states with capacity)
+        let mut level1: Vec<[BaseField; N_STATE]> = Vec::new();
         for i in 0..4 {
             let left = level0[i * 2];
             let right = level0[i * 2 + 1];
-            level1.push(hash_two_nodes(left, right));
+            level1.push(hash_two_nodes(left, right)); // Returns full state (16 elem)
         }
         let sibling1_index = if current_index % 2 == 0 {
             current_index + 1
         } else {
             current_index - 1
         };
-        siblings.push(level1[sibling1_index]);
+        siblings.push(level1[sibling1_index]); // Already 16 elements
+
+        // Extract rate part for hash_two_nodes (needs 8-elem arrays)
+        let current_rate: [BaseField; RATE] = std::array::from_fn(|i| level1[current_index][i]);
+        let sibling1_rate: [BaseField; RATE] = std::array::from_fn(|i| level1[sibling1_index][i]);
         let _parent1 = if current_index % 2 == 0 {
-            hash_two_nodes(level1[current_index], level1[sibling1_index])
+            hash_two_nodes(current_rate, sibling1_rate)
         } else {
-            hash_two_nodes(level1[sibling1_index], level1[current_index])
+            hash_two_nodes(sibling1_rate, current_rate)
         };
         current_index /= 2;
 
-        // Level 2: 2 nodes
-        let mut level2 = Vec::new();
+        // Level 2: 2 nodes (full 16-elem states)
+        let mut level2: Vec<[BaseField; N_STATE]> = Vec::new();
         for i in 0..2 {
-            let left = level1[i * 2];
-            let right = level1[i * 2 + 1];
-            level2.push(hash_two_nodes(left, right));
+            // Extract rate parts for hashing
+            let left_rate: [BaseField; RATE] = std::array::from_fn(|j| level1[i * 2][j]);
+            let right_rate: [BaseField; RATE] = std::array::from_fn(|j| level1[i * 2 + 1][j]);
+            level2.push(hash_two_nodes(left_rate, right_rate)); // Returns full state
         }
         let sibling2_index = if current_index % 2 == 0 {
             current_index + 1
         } else {
             current_index - 1
         };
-        siblings.push(level2[sibling2_index]);
+        siblings.push(level2[sibling2_index]); // Already 16 elements
 
-        // Root
-        let expected_root = hash_two_nodes(level2[0], level2[1]);
+        // Root (extract rate parts for final hash)
+        let level2_0_rate: [BaseField; RATE] = std::array::from_fn(|i| level2[0][i]);
+        let level2_1_rate: [BaseField; RATE] = std::array::from_fn(|i| level2[1][i]);
+        let expected_root_full = hash_two_nodes(level2_0_rate, level2_1_rate); // Returns full 16-elem state
+        let expected_root: [BaseField; RATE] = std::array::from_fn(|i| expected_root_full[i]); // Extract rate part
 
         println!("Built Merkle tree:");
         println!("  Depth: {}", depth);
@@ -874,8 +892,11 @@ mod tests {
         println!("Leaf with value 123 (and padding):");
         println!("  {:?}", &leaf);
 
-        // Helper function (same as before)
-        fn hash_two_nodes(left: [BaseField; RATE], right: [BaseField; RATE]) -> [BaseField; RATE] {
+        // Helper function - now returns FULL state (16 elements)
+        fn hash_two_nodes(
+            left: [BaseField; RATE],
+            right: [BaseField; RATE],
+        ) -> [BaseField; N_STATE] {
             use super::{
                 apply_external_round_matrix, apply_internal_round_matrix, pow5,
                 EXTERNAL_ROUND_CONSTS, INTERNAL_ROUND_CONSTS, N_HALF_FULL_ROUNDS, N_PARTIAL_ROUNDS,
@@ -937,9 +958,8 @@ mod tests {
                 state = std::array::from_fn(|i| pow5(state[i]));
             }
 
-            let mut result = [BaseField::from_u32_unchecked(0); RATE];
-            result.copy_from_slice(&state[0..RATE]);
-            result
+            // Return FULL state (16 elements) including capacity
+            state
         }
 
         // Build tree with 4 leaves
@@ -958,36 +978,46 @@ mod tests {
         // Our target leaf with value 123
         leaves[leaf_index] = leaf;
 
-        // Compute siblings
+        // Compute siblings (now 16 elements each - rate + capacity)
         let mut siblings = Vec::new();
         let mut current_index = leaf_index;
 
-        // Level 0
+        // Level 0: leaves (convert 8-elem to 16-elem with capacity=0)
         let level0 = leaves.clone();
         let sibling0_index = if current_index % 2 == 0 {
             current_index + 1
         } else {
             current_index - 1
         };
-        siblings.push(level0[sibling0_index]);
+        let sibling0_full: [BaseField; N_STATE] = std::array::from_fn(|i| {
+            if i < RATE {
+                level0[sibling0_index][i]
+            } else {
+                BaseField::from_u32_unchecked(0) // capacity = 0 for leaves
+            }
+        });
+        siblings.push(sibling0_full);
         current_index /= 2;
 
-        // Level 1
-        let mut level1 = Vec::new();
+        // Level 1: hash nodes (already 16 elements from hash_two_nodes)
+        let mut level1: Vec<[BaseField; N_STATE]> = Vec::new();
         for i in 0..2 {
             let left = level0[i * 2];
             let right = level0[i * 2 + 1];
-            level1.push(hash_two_nodes(left, right));
+            level1.push(hash_two_nodes(left, right)); // Returns 16-elem state
         }
         let sibling1_index = if current_index % 2 == 0 {
             current_index + 1
         } else {
             current_index - 1
         };
-        siblings.push(level1[sibling1_index]);
+        siblings.push(level1[sibling1_index]); // Already 16 elements
 
-        // Root
-        let expected_root = hash_two_nodes(level1[0], level1[1]);
+        // Root (extract rate parts for hashing)
+        let level1_0_rate: [BaseField; RATE] = std::array::from_fn(|i| level1[0][i]);
+        let level1_1_rate: [BaseField; RATE] = std::array::from_fn(|i| level1[1][i]);
+        let expected_root_full = hash_two_nodes(level1_0_rate, level1_1_rate);
+        let expected_root: [BaseField; RATE] = std::array::from_fn(|i| expected_root_full[i]);
 
         println!("\nBuilt Merkle tree:");
         println!("  Depth: {}", depth);
@@ -1043,8 +1073,11 @@ mod tests {
         println!("Leaf with user_id=123, balance=456:");
         println!("  {:?}", &leaf);
 
-        // Use same helper function
-        fn hash_two_nodes(left: [BaseField; RATE], right: [BaseField; RATE]) -> [BaseField; RATE] {
+        // Use same helper function - returns FULL state (16 elements)
+        fn hash_two_nodes(
+            left: [BaseField; RATE],
+            right: [BaseField; RATE],
+        ) -> [BaseField; N_STATE] {
             use super::{
                 apply_external_round_matrix, apply_internal_round_matrix, pow5,
                 EXTERNAL_ROUND_CONSTS, INTERNAL_ROUND_CONSTS, N_HALF_FULL_ROUNDS, N_PARTIAL_ROUNDS,
@@ -1096,9 +1129,8 @@ mod tests {
                 apply_external_round_matrix(&mut state);
                 state = std::array::from_fn(|i| pow5(state[i]));
             }
-            let mut result = [BaseField::from_u32_unchecked(0); RATE];
-            result.copy_from_slice(&state[0..RATE]);
-            result
+            // Return FULL state (16 elements)
+            state
         }
 
         let mut leaves: Vec<[BaseField; RATE]> = vec![
@@ -1112,6 +1144,7 @@ mod tests {
         leaves[3][0] = BaseField::from_u32_unchecked(30);
         leaves[leaf_index] = leaf;
 
+        // Siblings now 16 elements
         let mut siblings = Vec::new();
         let mut current_index = leaf_index;
         let level0 = leaves.clone();
@@ -1120,9 +1153,16 @@ mod tests {
         } else {
             current_index - 1
         };
-        siblings.push(level0[sibling0_index]);
+        let sibling0_full: [BaseField; N_STATE] = std::array::from_fn(|i| {
+            if i < RATE {
+                level0[sibling0_index][i]
+            } else {
+                BaseField::from_u32_unchecked(0)
+            }
+        });
+        siblings.push(sibling0_full);
         current_index /= 2;
-        let mut level1 = Vec::new();
+        let mut level1: Vec<[BaseField; N_STATE]> = Vec::new();
         for i in 0..2 {
             level1.push(hash_two_nodes(level0[i * 2], level0[i * 2 + 1]));
         }
@@ -1132,7 +1172,10 @@ mod tests {
             current_index - 1
         };
         siblings.push(level1[sibling1_index]);
-        let expected_root = hash_two_nodes(level1[0], level1[1]);
+        let level1_0_rate: [BaseField; RATE] = std::array::from_fn(|i| level1[0][i]);
+        let level1_1_rate: [BaseField; RATE] = std::array::from_fn(|i| level1[1][i]);
+        let expected_root_full = hash_two_nodes(level1_0_rate, level1_1_rate);
+        let expected_root: [BaseField; RATE] = std::array::from_fn(|i| expected_root_full[i]);
 
         println!(
             "\nProving leaf contains user_id={}, balance={}",
@@ -1187,7 +1230,10 @@ mod tests {
         println!("  status:    {}", leaf[3]);
         println!("  Full leaf: {:?}", &leaf);
 
-        fn hash_two_nodes(left: [BaseField; RATE], right: [BaseField; RATE]) -> [BaseField; RATE] {
+        fn hash_two_nodes(
+            left: [BaseField; RATE],
+            right: [BaseField; RATE],
+        ) -> [BaseField; N_STATE] {
             use super::{
                 apply_external_round_matrix, apply_internal_round_matrix, pow5,
                 EXTERNAL_ROUND_CONSTS, INTERNAL_ROUND_CONSTS, N_HALF_FULL_ROUNDS, N_PARTIAL_ROUNDS,
@@ -1239,9 +1285,7 @@ mod tests {
                 apply_external_round_matrix(&mut state);
                 state = std::array::from_fn(|i| pow5(state[i]));
             }
-            let mut result = [BaseField::from_u32_unchecked(0); RATE];
-            result.copy_from_slice(&state[0..RATE]);
-            result
+            state
         }
 
         let mut leaves: Vec<[BaseField; RATE]> = vec![
@@ -1260,9 +1304,16 @@ mod tests {
         } else {
             current_index - 1
         };
-        siblings.push(level0[sibling0_index]);
+        let sibling0_full: [BaseField; N_STATE] = std::array::from_fn(|i| {
+            if i < RATE {
+                level0[sibling0_index][i]
+            } else {
+                BaseField::from_u32_unchecked(0)
+            }
+        });
+        siblings.push(sibling0_full);
         current_index /= 2;
-        let mut level1 = Vec::new();
+        let mut level1: Vec<[BaseField; N_STATE]> = Vec::new();
         for i in 0..2 {
             level1.push(hash_two_nodes(level0[i * 2], level0[i * 2 + 1]));
         }
@@ -1272,7 +1323,10 @@ mod tests {
             current_index - 1
         };
         siblings.push(level1[sibling1_index]);
-        let expected_root = hash_two_nodes(level1[0], level1[1]);
+        let level1_0_rate: [BaseField; RATE] = std::array::from_fn(|i| level1[0][i]);
+        let level1_1_rate: [BaseField; RATE] = std::array::from_fn(|i| level1[1][i]);
+        let expected_root_full = hash_two_nodes(level1_0_rate, level1_1_rate);
+        let expected_root: [BaseField; RATE] = std::array::from_fn(|i| expected_root_full[i]);
 
         let config = PcsConfig::default();
         let channel = &mut Blake2sChannel::default();
@@ -1331,7 +1385,10 @@ mod tests {
         println!("  [7] metadata:  {}", leaf[7]);
         println!("  Full: {:?}", &leaf);
 
-        fn hash_two_nodes(left: [BaseField; RATE], right: [BaseField; RATE]) -> [BaseField; RATE] {
+        fn hash_two_nodes(
+            left: [BaseField; RATE],
+            right: [BaseField; RATE],
+        ) -> [BaseField; N_STATE] {
             use super::{
                 apply_external_round_matrix, apply_internal_round_matrix, pow5,
                 EXTERNAL_ROUND_CONSTS, INTERNAL_ROUND_CONSTS, N_HALF_FULL_ROUNDS, N_PARTIAL_ROUNDS,
@@ -1383,9 +1440,7 @@ mod tests {
                 apply_external_round_matrix(&mut state);
                 state = std::array::from_fn(|i| pow5(state[i]));
             }
-            let mut result = [BaseField::from_u32_unchecked(0); RATE];
-            result.copy_from_slice(&state[0..RATE]);
-            result
+            state
         }
 
         let mut leaves: Vec<[BaseField; RATE]> = vec![
@@ -1404,9 +1459,16 @@ mod tests {
         } else {
             current_index - 1
         };
-        siblings.push(level0[sibling0_index]);
+        let sibling0_full: [BaseField; N_STATE] = std::array::from_fn(|i| {
+            if i < RATE {
+                level0[sibling0_index][i]
+            } else {
+                BaseField::from_u32_unchecked(0)
+            }
+        });
+        siblings.push(sibling0_full);
         current_index /= 2;
-        let mut level1 = Vec::new();
+        let mut level1: Vec<[BaseField; N_STATE]> = Vec::new();
         for i in 0..2 {
             level1.push(hash_two_nodes(level0[i * 2], level0[i * 2 + 1]));
         }
@@ -1416,7 +1478,10 @@ mod tests {
             current_index - 1
         };
         siblings.push(level1[sibling1_index]);
-        let expected_root = hash_two_nodes(level1[0], level1[1]);
+        let level1_0_rate: [BaseField; RATE] = std::array::from_fn(|i| level1[0][i]);
+        let level1_1_rate: [BaseField; RATE] = std::array::from_fn(|i| level1[1][i]);
+        let expected_root_full = hash_two_nodes(level1_0_rate, level1_1_rate);
+        let expected_root: [BaseField; RATE] = std::array::from_fn(|i| expected_root_full[i]);
 
         let config = PcsConfig::default();
         let channel = &mut Blake2sChannel::default();
@@ -1489,7 +1554,10 @@ mod tests {
         println!("\n📋 STEP 2: Build tree (hash all pairs)");
         println!("========================================");
 
-        fn hash_two_nodes(left: [BaseField; RATE], right: [BaseField; RATE]) -> [BaseField; RATE] {
+        fn hash_two_nodes(
+            left: [BaseField; RATE],
+            right: [BaseField; RATE],
+        ) -> [BaseField; N_STATE] {
             use super::{
                 apply_external_round_matrix, apply_internal_round_matrix, pow5,
                 EXTERNAL_ROUND_CONSTS, INTERNAL_ROUND_CONSTS, N_HALF_FULL_ROUNDS, N_PARTIAL_ROUNDS,
@@ -1541,21 +1609,22 @@ mod tests {
                 apply_external_round_matrix(&mut state);
                 state = std::array::from_fn(|i| pow5(state[i]));
             }
-            let mut result = [BaseField::from_u32_unchecked(0); RATE];
-            result.copy_from_slice(&state[0..RATE]);
-            result
+            state
         }
 
         // Level 0 → Level 1
-        let h01 = hash_two_nodes(l0, l1);
-        let h23 = hash_two_nodes(l2, l3);
+        let h01 = hash_two_nodes(l0, l1); // Returns 16 elem (rate + capacity)
+        let h23 = hash_two_nodes(l2, l3); // Returns 16 elem (rate + capacity)
 
         println!("Level 1:");
         println!("  H01 = hash(L0, L1) = [{}, {}, ...]", h01[0], h01[1]);
         println!("  H23 = hash(L2, L3) = [{}, {}, ...]", h23[0], h23[1]);
 
         // Level 1 → Root
-        let root = hash_two_nodes(h01, h23);
+        let h01_rate: [BaseField; RATE] = std::array::from_fn(|i| h01[i]);
+        let h23_rate: [BaseField; RATE] = std::array::from_fn(|i| h23[i]);
+        let root_full = hash_two_nodes(h01_rate, h23_rate); // Returns 16 elem
+        let root: [BaseField; RATE] = std::array::from_fn(|i| root_full[i]); // Extract rate
 
         println!("\nRoot:");
         println!("  ROOT = hash(H01, H23) = [{}, {}, ...]", root[0], root[1]);
@@ -1564,10 +1633,17 @@ mod tests {
         println!("======================================================");
 
         // For index=2 (binary 10):
-        // Level 0: sibling is L3
-        // Level 1: sibling is H01
+        // Level 0: sibling is L3 (leaf - needs capacity=0)
+        // Level 1: sibling is H01 (hash - already has capacity)
 
-        let siblings = vec![l3, h01];
+        let l3_full: [BaseField; N_STATE] = std::array::from_fn(|i| {
+            if i < RATE {
+                l3[i]
+            } else {
+                BaseField::from_u32_unchecked(0)
+            }
+        });
+        let siblings = vec![l3_full, h01]; // Both are now 16 elements
 
         println!("Path from L2 (index={}, binary=10):", leaf_index);
         println!("  Level 0: L2 with sibling L3 → H23");

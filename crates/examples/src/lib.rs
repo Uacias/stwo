@@ -12,6 +12,8 @@ pub mod poseidon_u_components;
 pub mod poseidon_uacias;
 pub mod poseidon_uacias_components;
 pub mod poseidon_uacias_components_merkle;
+pub mod poseidon_uacias_components_merkle_final;
+pub mod poseidon_uacias_components_merklev2;
 pub mod poseidon_uacias_copy;
 pub mod poseidon_uacias_no_trace;
 pub mod poseidon_uaciasv2;

@@ -458,7 +458,7 @@ pub fn gen_merkle_computing_trace(
     log_size: u32,
     depth: usize,
     leaf: [BaseField; RATE],
-    siblings: Vec<[BaseField; RATE]>,
+    siblings: Vec<[BaseField; N_STATE]>,  // Changed: siblings are now 16 elements (rate + capacity)
     index: u32,
 ) -> (
     ColumnVec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>,
@@ -504,20 +504,24 @@ pub fn gen_merkle_computing_trace(
             let is_second_absorption = (row % 2) == 1; // false = first node, true = second node
             let index_bit = (index >> level) & 1;
 
-            // Determine which message to absorb
-            let message = if !is_second_absorption {
+            // Determine which message to absorb (only rate part - 8 elements)
+            let (message, message_is_sibling) = if !is_second_absorption {
                 // First absorption: absorb left node based on index_bit
                 if index_bit == 0 {
-                    current_node // current on left
+                    (current_node, false) // current on left
                 } else {
-                    siblings[level] // sibling on left
+                    // Extract rate part from sibling (first 8 elements)
+                    let sibling_rate: [BaseField; RATE] = std::array::from_fn(|i| siblings[level][i]);
+                    (sibling_rate, true) // sibling on left
                 }
             } else {
                 // Second absorption: absorb right node based on index_bit
                 if index_bit == 0 {
-                    siblings[level] // sibling on right
+                    // Extract rate part from sibling
+                    let sibling_rate: [BaseField; RATE] = std::array::from_fn(|i| siblings[level][i]);
+                    (sibling_rate, true) // sibling on right
                 } else {
-                    current_node // current on right
+                    (current_node, false) // current on right
                 }
             };
 
@@ -527,19 +531,32 @@ pub fn gen_merkle_computing_trace(
                 col_index += 1;
             }
 
-            // Compute initial_state (SPONGE CONSTRUCTION)
-            // For Merkle: each level is a fresh sponge (reset capacity at start of level)
+            // Compute initial_state (NO CAPACITY RESET! - user's new approach)
+            // Capacity comes from sibling (if used) or previous output
             let is_level_start = !is_second_absorption; // First absorption of each level
             let state: [BaseField; N_STATE] = if row == 0 {
-                // First row: state = [message, zeros]
-                let mut s = [BaseField::from_u32_unchecked(0); N_STATE];
-                s[0..RATE].copy_from_slice(&message);
-                s
+                // First row: capacity from sibling if used, otherwise zeros
+                std::array::from_fn(|i| {
+                    if i < RATE {
+                        message[i] // Rate part
+                    } else if message_is_sibling {
+                        siblings[level][i] // Capacity from sibling (elements 8-15)
+                    } else {
+                        BaseField::from_u32_unchecked(0) // Capacity = 0 (leaf has no capacity)
+                    }
+                })
             } else if is_level_start {
-                // Start of new level: RESET capacity to zeros (fresh sponge for this level)
-                let mut s = [BaseField::from_u32_unchecked(0); N_STATE];
-                s[0..RATE].copy_from_slice(&message);
-                s
+                // Start of new level: NO RESET! Capacity from sibling OR previous output
+                let prev = prev_output.unwrap();
+                std::array::from_fn(|i| {
+                    if i < RATE {
+                        message[i] // Rate part
+                    } else if message_is_sibling {
+                        siblings[level][i] // Capacity from sibling (if left node is sibling)
+                    } else {
+                        prev[i] // Capacity from PREVIOUS level (NO RESET!)
+                    }
+                })
             } else {
                 // Second absorption of same level: state = [prev_rate + message, prev_capacity]
                 let prev = prev_output.unwrap();
