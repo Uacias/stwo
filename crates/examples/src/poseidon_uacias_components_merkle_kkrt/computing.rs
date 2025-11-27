@@ -1,3 +1,4 @@
+use num_traits::One;
 use stwo::core::fields::qm31::SecureField;
 use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
 use stwo_constraint_framework::{
@@ -24,12 +25,15 @@ use super::{
 ///   * initial_state[1] = right child
 ///   * initial_state[2..15] = 0 (implicit capacity = 0)
 /// - Columns 16-...: intermediate states (full rounds + partial rounds)
-/// - Columns ...-end: final_state (N_STATE=16 elements) - hash result
+/// - Columns ...-157: final_state (N_STATE=16 elements) - hash result
+/// - Column 158: index_bit (0 or 1) - determines position of current node
 ///
 /// Constraints (KKRT - single permutation per level):
 /// 1. Initial state constraint: initial_state[2..16] must be zero (implicit capacity)
-/// 2. Poseidon2 permutation correctness - masked by is_active
-/// 3. LogUp: yields final_state[0] (computed root, 1 element) ONLY at last row (multiplicity = is_last)
+/// 2. Chaining constraint (for rows 1..depth): final_state_prev[0] must appear in
+///    initial_state[0] or initial_state[1] based on index_bit
+/// 3. Poseidon2 permutation correctness - masked by is_active
+/// 4. LogUp: yields final_state[0] (computed root, 1 element) ONLY at last row (multiplicity = is_last)
 #[derive(Clone)]
 pub struct MerkleComputingEval {
     pub log_n_rows: u32,
@@ -38,7 +42,6 @@ pub struct MerkleComputingEval {
     pub claimed_sum: SecureField,
     pub is_first_id: PreProcessedColumnId,
     pub is_active_id: PreProcessedColumnId, // 1 for rows 0..depth, 0 for padding
-    pub is_level_start_id: PreProcessedColumnId, // Not used in KKRT (kept for compatibility)
     pub is_last_id: PreProcessedColumnId,   // 1 only for row (depth-1), for LogUp
 }
 
@@ -52,9 +55,8 @@ impl FrameworkEval for MerkleComputingEval {
     }
 
     fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {
-        let _is_first_val = eval.get_preprocessed_column(self.is_first_id.clone());
+        let is_first_val = eval.get_preprocessed_column(self.is_first_id.clone());
         let is_active_val = eval.get_preprocessed_column(self.is_active_id.clone());
-        let _is_level_start_val = eval.get_preprocessed_column(self.is_level_start_id.clone());
         let is_last_val = eval.get_preprocessed_column(self.is_last_id.clone());
 
         // KKRT: NO message columns - initial_state contains [left, right, 0, ..., 0] directly
@@ -97,22 +99,57 @@ impl FrameworkEval for MerkleComputingEval {
         }
         let final_state_curr: [E::F; N_STATE] =
             std::array::from_fn(|i| final_state_curr_vec[i].clone());
-        let _final_state_prev: [E::F; N_STATE] =
+        let final_state_prev: [E::F; N_STATE] =
             std::array::from_fn(|i| final_state_prev_vec[i].clone());
+
+        // Read index_bit (1 element) - current row only
+        // index_bit = 0: current node is on left (initial_state[0])
+        // index_bit = 1: current node is on right (initial_state[1])
+        let [index_bit_curr, _index_bit_prev] =
+            eval.next_interaction_mask(ORIGINAL_TRACE_IDX, [0, -1]);
 
         // KKRT Constraint 1: Implicit capacity must be zero
         // initial_state[2..16] = 0 (elements after left and right children)
         // This ensures the KKRT format: [left, right, 0, 0, ..., 0]
         for i in 2..N_STATE {
-            eval.add_constraint(
-                is_active_val.clone() * initial_state_curr[i].clone(),
-            );
+            eval.add_constraint(is_active_val.clone() * initial_state_curr[i].clone());
         }
 
-        // KKRT: NO transition constraints (no sequential absorption)
-        // Each row is independent - single permutation with [left, right, 0, ...]
+        // KKRT Constraint 2: Chaining constraint
+        // For rows 1..depth (not first row): final_state_prev[0] must be in current row's input
+        // If index_bit = 0: current node on left  -> initial_state[0] = final_state_prev[0]
+        // If index_bit = 1: current node on right -> initial_state[1] = final_state_prev[0]
+        //
+        // Combined constraint (enabled for non-first active rows):
+        // (1 - index_bit) * (initial_state[0] - final_state_prev[0]) = 0  (when index_bit=0)
+        // index_bit * (initial_state[1] - final_state_prev[0]) = 0        (when index_bit=1)
+        let not_first = E::F::one() - is_first_val.clone();
+        let enable_chaining = is_active_val.clone() * not_first;
 
-        // Constraint 2: Poseidon2 permutation correctness
+        // When index_bit = 0: current node is on left, so initial_state[0] = prev_hash
+        let one_minus_index_bit = E::F::one() - index_bit_curr.clone();
+        eval.add_constraint(
+            enable_chaining.clone()
+                * one_minus_index_bit
+                * (initial_state_curr[0].clone() - final_state_prev[0].clone()),
+        );
+
+        // When index_bit = 1: current node is on right, so initial_state[1] = prev_hash
+        eval.add_constraint(
+            enable_chaining
+                * index_bit_curr.clone()
+                * (initial_state_curr[1].clone() - final_state_prev[0].clone()),
+        );
+
+        // KKRT Constraint 3: index_bit must be 0 or 1 (boolean constraint)
+        // index_bit * (1 - index_bit) = 0
+        eval.add_constraint(
+            is_active_val.clone()
+                * index_bit_curr.clone()
+                * (E::F::one() - index_bit_curr.clone()),
+        );
+
+        // Constraint 4: Poseidon2 permutation correctness
         // Verify that the intermediate states match the permutation computation
         // MASKED BY is_active: Only enforce for active rows
         let mut state = initial_state_curr.clone();

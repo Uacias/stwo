@@ -308,43 +308,6 @@ pub fn is_last_column_id(log_size: u32, depth: usize) -> PreProcessedColumnId {
     }
 }
 
-/// Generates the is_level_start preprocessed column
-///
-/// Marks which rows are the START of a new Merkle level (even rows: 0, 2, 4, ...).
-/// These rows should have capacity=0 (fresh sponge for each level).
-/// Only active even rows have value 1, all other rows have value 0.
-///
-/// # Arguments
-/// * `log_size` - Log2 of trace size
-/// * `depth` - Tree depth (number of tree levels)
-///
-/// # Returns
-/// Column where rows 0, 2, 4, ..., (2*depth-2) are 1, rest are 0
-pub fn gen_is_level_start_column(
-    log_size: u32,
-    depth: usize,
-) -> CircleEvaluation<SimdBackend, BaseField, BitReversedOrder> {
-    let n_rows = 1 << log_size;
-    let n_active_rows = depth; // KKRT: 1 row per level
-
-    let mut col = Col::<SimdBackend, BaseField>::zeros(n_rows);
-
-    // KKRT: Every active row is a level start (rows 0, 1, 2, ..., depth-1)
-    for row in 0..n_active_rows {
-        col.set(row, BaseField::from_u32_unchecked(1));
-    }
-
-    bit_reverse_coset_to_circle_domain_order(col.as_mut_slice());
-
-    CircleEvaluation::new(CanonicCoset::new(log_size).circle_domain(), col)
-}
-
-pub fn is_level_start_column_id(log_size: u32, depth: usize) -> PreProcessedColumnId {
-    PreProcessedColumnId {
-        id: format!("is_level_start_{}_{}", log_size, depth),
-    }
-}
-
 /// Statement 0 for Merkle verification: Component configuration
 /// This is mixed into the channel before drawing the PoseidonRelation
 #[derive(Clone, Copy, Debug)]
@@ -363,20 +326,21 @@ impl MerkleStatement0 {
     pub fn log_sizes(&self) -> TreeVec<Vec<u32>> {
         // For Merkle (KKRT STYLE): Calculate actual column counts
         // Computing: NO message columns + initial_state (16) +
-        //            intermediates (full1: 4*16, partial: 14, full2: 4*16) + final_state (16)
-        // = 16 + 64 + 14 + 64 + 16 = 174 columns
+        //            intermediates (full1: 4*16, partial: 14, full2: 4*16) + final_state (16) + index_bit (1)
+        // = 16 + 64 + 14 + 64 + 16 + 1 = 175 columns
         const MERKLE_COMPUTING_N_COLUMNS: usize = N_STATE
             + (N_HALF_FULL_ROUNDS * N_STATE)
             + N_PARTIAL_ROUNDS
             + (N_HALF_FULL_ROUNDS * N_STATE)
-            + N_STATE;
+            + N_STATE
+            + 1; // index_bit column for chaining constraint
 
         // Scheduler (KKRT): computed_root (1) + expected_root (1) = 2 columns
         const MERKLE_SCHEDULER_N_COLUMNS: usize = 2;
 
         TreeVec(vec![
-            // Tree 0: Preprocessed (4 columns: is_first, is_active, is_level_start, is_last)
-            vec![self.log_size; 4],
+            // Tree 0: Preprocessed (3 columns: is_first, is_active, is_last)
+            vec![self.log_size; 3],
             // Tree 1: Main traces (Computing + Scheduler)
             vec![self.log_size; MERKLE_COMPUTING_N_COLUMNS + MERKLE_SCHEDULER_N_COLUMNS],
             // Tree 2: Interaction traces (2 components * 4 columns each = 8)
@@ -462,11 +426,10 @@ pub fn prove_merkle(
     let n_active_rows = depth;
     let is_first_col = gen_is_first_column(log_size);
     let is_active_col = gen_is_active_column(log_size, n_active_rows);
-    let is_level_start_col = gen_is_level_start_column(log_size, depth);
     let is_last_col = gen_is_last_column(log_size, depth);
 
-    let preprocessed_trace = vec![is_first_col, is_active_col, is_level_start_col, is_last_col];
-    println!("Generated 4 preprocessed columns");
+    let preprocessed_trace = vec![is_first_col, is_active_col, is_last_col];
+    println!("Generated 3 preprocessed columns");
 
     let mut tree_builder = commitment_scheme.tree_builder();
     tree_builder.extend_evals(preprocessed_trace);
@@ -544,7 +507,6 @@ pub fn prove_merkle(
             claimed_sum: claimed_sum_computing,
             is_first_id: is_first_id.clone(),
             is_active_id: is_active_column_id(log_size, n_active_rows),
-            is_level_start_id: is_level_start_column_id(log_size, depth),
             is_last_id: is_last_column_id(log_size, depth),
         },
         claimed_sum_computing,
@@ -650,7 +612,6 @@ pub fn verify_merkle(
             claimed_sum: statement1.claimed_sum_computing,
             is_first_id: is_first_id.clone(),
             is_active_id: is_active_column_id(log_size, depth), // KKRT: depth active rows
-            is_level_start_id: is_level_start_column_id(log_size, depth),
             is_last_id: is_last_column_id(log_size, depth),
         },
         statement1.claimed_sum_computing,
@@ -1978,7 +1939,7 @@ mod tests {
         let depth = 2;
 
         // KKRT counts
-        const KKRT_COMPUTING_COLS: usize = 174; // No message columns
+        const KKRT_COMPUTING_COLS: usize = 175; // No message columns + index_bit
         const KKRT_SCHEDULER_COLS: usize = 2;    // 1 + 1
         let kkrt_total = KKRT_COMPUTING_COLS + KKRT_SCHEDULER_COLS;
 

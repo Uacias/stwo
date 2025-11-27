@@ -472,13 +472,14 @@ pub fn gen_merkle_computing_trace(
     assert!(n_active_rows <= n_rows, "depth must be <= n_rows");
 
     // Column layout (KKRT STYLE - no message columns):
-    // initial_state (16) + intermediates (4*16 + 14 + 4*16 = 142) + final_state (16)
-    // = 16 + 142 + 16 = 174 columns
+    // initial_state (16) + intermediates (4*16 + 14 + 4*16 = 142) + final_state (16) + index_bit (1)
+    // = 16 + 142 + 16 + 1 = 175 columns
     const MERKLE_COMPUTING_N_COLUMNS: usize = N_STATE
         + (N_HALF_FULL_ROUNDS * N_STATE)
         + N_PARTIAL_ROUNDS
         + (N_HALF_FULL_ROUNDS * N_STATE)
-        + N_STATE;
+        + N_STATE
+        + 1; // index_bit column for chaining constraint
 
     let mut trace = (0..MERKLE_COMPUTING_N_COLUMNS)
         .map(|_| Col::<SimdBackend, BaseField>::zeros(n_rows))
@@ -574,6 +575,10 @@ pub fn gen_merkle_computing_trace(
                 trace[col_index].set(row, state[i]);
                 col_index += 1;
             }
+
+            // Write index_bit (1 element) - needed for chaining constraint
+            trace[col_index].set(row, BaseField::from_u32_unchecked(index_bit));
+            // col_index not incremented as this is the last column
 
             // Extract hash output: ONLY state[0] (KKRT style)
             let hash_output = state[0];
