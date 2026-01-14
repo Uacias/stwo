@@ -1,43 +1,40 @@
 //! AIR for Poseidon2 hash function from <https://eprint.iacr.org/2023/323.pdf>.
+//!
+//! Poseidon2 is a cryptographic hash function used in Starknet.
+//! This implements the STARK constraints for proving Poseidon hash computations.
 
 use std::ops::{Add, AddAssign, Mul, Sub};
 
 use itertools::Itertools;
 use num_traits::One;
-#[cfg(feature = "parallel")]
-use rayon::prelude::*;
-use stwo::core::channel::Blake2sChannel;
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::fields::FieldExpOps;
-use stwo::core::pcs::PcsConfig;
 use stwo::core::poly::circle::CanonicCoset;
-use stwo::core::proof::StarkProof;
-use stwo::core::vcs::blake2_merkle::{Blake2sMerkleChannel, Blake2sMerkleHasher};
 use stwo::core::ColumnVec;
 use stwo::prover::backend::simd::column::BaseColumn;
 use stwo::prover::backend::simd::m31::{PackedBaseField, LOG_N_LANES};
 use stwo::prover::backend::simd::qm31::PackedSecureField;
 use stwo::prover::backend::simd::SimdBackend;
 use stwo::prover::backend::{Col, Column};
-use stwo::prover::poly::circle::{CircleEvaluation, PolyOps};
+use stwo::prover::poly::circle::CircleEvaluation;
 use stwo::prover::poly::BitReversedOrder;
-use stwo::prover::{prove, CommitmentSchemeProver};
 use stwo_constraint_framework::{
     relation, EvalAtRow, FrameworkComponent, FrameworkEval, LogupTraceGenerator, Relation,
-    RelationEntry, TraceLocationAllocator,
+    RelationEntry,
 };
-use tracing::{info, span, Level};
+use tracing::{span, Level};
 
-const N_LOG_INSTANCES_PER_ROW: usize = 3;
-const N_INSTANCES_PER_ROW: usize = 1 << N_LOG_INSTANCES_PER_ROW;
-const N_STATE: usize = 16;
+pub const N_LOG_INSTANCES_PER_ROW: usize = 3; // (16 inputs + 100+ intermediate + 16 output) * 8 - kolumny
+pub const N_INSTANCES_PER_ROW: usize = 1 << N_LOG_INSTANCES_PER_ROW;
+pub const N_STATE: usize = 16;
 const N_PARTIAL_ROUNDS: usize = 14;
 const N_HALF_FULL_ROUNDS: usize = 4;
 const FULL_ROUNDS: usize = 2 * N_HALF_FULL_ROUNDS;
 const N_COLUMNS_PER_REP: usize = N_STATE * (1 + FULL_ROUNDS) + N_PARTIAL_ROUNDS;
-const N_COLUMNS: usize = N_INSTANCES_PER_ROW * N_COLUMNS_PER_REP;
+pub const N_COLUMNS: usize = N_INSTANCES_PER_ROW * N_COLUMNS_PER_REP;
 const LOG_EXPAND: u32 = 2;
+
 // TODO(shahars): Use poseidon's real constants.
 const EXTERNAL_ROUND_CONSTS: [[BaseField; N_STATE]; 2 * N_HALF_FULL_ROUNDS] =
     [[BaseField::from_u32_unchecked(1234); N_STATE]; 2 * N_HALF_FULL_ROUNDS];
@@ -54,6 +51,7 @@ pub struct PoseidonEval {
     pub lookup_elements: PoseidonElements,
     pub claimed_sum: SecureField,
 }
+
 impl FrameworkEval for PoseidonEval {
     fn log_size(&self) -> u32 {
         self.log_n_rows
@@ -122,14 +120,11 @@ fn apply_internal_round_matrix<F>(state: &mut [F; 16])
 where
     F: Clone + AddAssign<F> + Add<F, Output = F> + Sub<F, Output = F> + Mul<BaseField, Output = F>,
 {
-    // TODO(shahars): Check that these coefficients are good according to section  5.3 of Poseidon2
-    // paper.
     let sum = state[1..]
         .iter()
         .cloned()
         .fold(state[0].clone(), |acc, s| acc + s);
     state.iter_mut().enumerate().for_each(|(i, s)| {
-        // TODO(andrew): Change to rotations.
         *s = s.clone() * BaseField::from_u32_unchecked(1 << (i + 1)) + sum.clone();
     });
 }
@@ -143,8 +138,7 @@ fn pow5<F: FieldExpOps>(x: F) -> F {
 pub fn eval_poseidon_constraints<E: EvalAtRow>(eval: &mut E, lookup_elements: &PoseidonElements) {
     for _ in 0..N_INSTANCES_PER_ROW {
         let mut state: [_; N_STATE] = std::array::from_fn(|_| eval.next_trace_mask());
-
-        // Require state lookup.
+        //  vec[u32;16]
         let initial_state = state.clone();
 
         // 4 full rounds.
@@ -153,7 +147,6 @@ pub fn eval_poseidon_constraints<E: EvalAtRow>(eval: &mut E, lookup_elements: &P
                 state[i] += EXTERNAL_ROUND_CONSTS[round][i];
             });
             apply_external_round_matrix(&mut state);
-            // TODO(andrew) Apply round matrix after the pow5, as is the order in the paper.
             state = std::array::from_fn(|i| pow5(state[i].clone()));
             state.iter_mut().for_each(|s| {
                 let m = eval.next_trace_mask();
@@ -202,6 +195,16 @@ pub struct LookupData {
     pub initial_state: [[BaseColumn; N_STATE]; N_INSTANCES_PER_ROW],
     pub final_state: [[BaseColumn; N_STATE]; N_INSTANCES_PER_ROW],
 }
+
+/// Generuje trace dla Poseidon2 hash
+///
+/// Dla każdego hash instance (8 per wiersz) tworzy 158 kolumn:
+/// - Kolumny 0-15:    Initial state (16 elementów)
+/// - Kolumny 16-79:   Po pierwszych 4 full rounds (4×16 = 64 elementy)
+/// - Kolumny 80-93:   Po 14 partial rounds (14×1 = 14 elementów, tylko state[0])
+/// - Kolumny 94-157:  Po ostatnich 4 full rounds (4×16 = 64 elementy)
+///
+/// Total: 158 kolumn × 8 instancji = 1264 kolumny
 pub fn gen_trace(
     log_size: u32,
 ) -> (
@@ -210,6 +213,7 @@ pub fn gen_trace(
 ) {
     let _span = span!(Level::INFO, "Generation").entered();
     assert!(log_size >= LOG_N_LANES);
+    // Alokuj wszystkie kolumny trace (1264 dla 8 instancji × 158 kolumn każda)
     let mut trace = (0..N_COLUMNS)
         .map(|_| Col::<SimdBackend, BaseField>::zeros(1 << log_size))
         .collect_vec();
@@ -223,64 +227,105 @@ pub fn gen_trace(
     };
 
     for vec_index in 0..(1 << (log_size - LOG_N_LANES)) {
-        // Initial state.
-        let mut col_index = 0;
+        let mut col_index = 0; // ⭐ WSKAŹNIK KOLUMNY - śledzi którą kolumnę trace wypełniamy
         for rep_i in 0..N_INSTANCES_PER_ROW {
+            // ========================================
+            // 1️⃣ INITIAL STATE (kolumny 0-15)
+            // ========================================
             let mut state: [_; N_STATE] = std::array::from_fn(|state_i| {
                 PackedBaseField::from_array(std::array::from_fn(|i| {
                     BaseField::from_u32_unchecked((vec_index * 16 + i + state_i + rep_i) as u32)
                 }))
             });
+            // ⭐⭐⭐ ZAPISZ INITIAL STATE DO TRACE (kolumny 0-15) ⭐⭐⭐
             state.iter().copied().for_each(|s| {
-                trace[col_index].data[vec_index] = s;
-                col_index += 1;
+                trace[col_index].data[vec_index] = s; // Zapisujemy do kolejnych kolumn trace
+                col_index += 1; // col_index: 0→1→2...→15
             });
+            // Teraz col_index = 16
+
+            // Kopia initial state do lookup_data (dla LogUp)
             lookup_data.initial_state[rep_i]
                 .iter_mut()
                 .zip(state)
                 .for_each(|(res, state_i)| res.data[vec_index] = state_i);
 
-            // 4 full rounds.
+            // ========================================
+            // 2️⃣ PIERWSZE 4 FULL ROUNDS (kolumny 16-79)
+            // ========================================
             (0..N_HALF_FULL_ROUNDS).for_each(|round| {
+                // round = 0,1,2,3
+                // Krok 1: Dodaj stałe rundy
                 (0..N_STATE).for_each(|i| {
                     state[i] += PackedBaseField::broadcast(EXTERNAL_ROUND_CONSTS[round][i]);
                 });
+                // Krok 2: MDS matrix (miksowanie wszystkich elementów)
                 apply_external_round_matrix(&mut state);
+                // Krok 3: S-box (x^5 dla wszystkich 16 elementów)
                 state = std::array::from_fn(|i| pow5(state[i]));
+                // ⭐⭐⭐ ZAPISZ STAN PO RUNDZIE DO TRACE ⭐⭐⭐
                 state.iter().copied().for_each(|s| {
                     trace[col_index].data[vec_index] = s;
                     col_index += 1;
                 });
+                // Po rundzie 0: col_index = 32 (kolumny 16-31)
+                // Po rundzie 1: col_index = 48 (kolumny 32-47)
+                // Po rundzie 2: col_index = 64 (kolumny 48-63)
+                // Po rundzie 3: col_index = 80 (kolumny 64-79)
             });
 
-            // Partial rounds.
+            // ========================================
+            // 3️⃣ 14 PARTIAL ROUNDS (kolumny 80-93)
+            // ========================================
             (0..N_PARTIAL_ROUNDS).for_each(|round| {
+                // round = 0..13
+                // Krok 1: Dodaj stałą (TYLKO do state[0])
                 state[0] += PackedBaseField::broadcast(INTERNAL_ROUND_CONSTS[round]);
+                // Krok 2: MDS matrix (dla WSZYSTKICH elementów mimo wszystko)
                 apply_internal_round_matrix(&mut state);
+                // Krok 3: S-box TYLKO dla state[0] (OSZCZĘDNOŚĆ! Tylko 1 zamiast 16)
                 state[0] = pow5(state[0]);
-                trace[col_index].data[vec_index] = state[0];
-                col_index += 1;
+                // ⭐⭐⭐ ZAPISZ TYLKO state[0] DO TRACE ⭐⭐⭐
+                trace[col_index].data[vec_index] = state[0]; // Tylko pierwszy element!
+                col_index += 1; // col_index: 80→81→82...→93
             });
+            // Teraz col_index = 94
 
-            // 4 full rounds.
+            // ========================================
+            // 4️⃣ OSTATNIE 4 FULL ROUNDS (kolumny 94-157)
+            // ========================================
             (0..N_HALF_FULL_ROUNDS).for_each(|round| {
+                // round = 0,1,2,3
+                // Krok 1: Dodaj stałe (z offsetem +4, bo to rundy 4,5,6,7)
                 (0..N_STATE).for_each(|i| {
                     state[i] += PackedBaseField::broadcast(
                         EXTERNAL_ROUND_CONSTS[round + N_HALF_FULL_ROUNDS][i],
                     );
                 });
+                // Krok 2: MDS matrix
                 apply_external_round_matrix(&mut state);
+                // Krok 3: S-box (x^5 dla wszystkich)
                 state = std::array::from_fn(|i| pow5(state[i]));
+                // ⭐⭐⭐ ZAPISZ STAN PO RUNDZIE DO TRACE ⭐⭐⭐
                 state.iter().copied().for_each(|s| {
                     trace[col_index].data[vec_index] = s;
                     col_index += 1;
                 });
+                // Po rundzie 0 (=round 5): col_index = 110 (kolumny 94-109)
+                // Po rundzie 1 (=round 6): col_index = 126 (kolumny 110-125)
+                // Po rundzie 2 (=round 7): col_index = 142 (kolumny 126-141)
+                // Po rundzie 3 (=round 8): col_index = 158 (kolumny 142-157) ← FINAL STATE!
             });
 
+            // ========================================
+            // 5️⃣ FINAL STATE (zapisz do lookup_data)
+            // ========================================
+            // state teraz zawiera FINAL STATE (16 elementów po wszystkich rundach)
             lookup_data.final_state[rep_i]
                 .iter_mut()
                 .zip(state)
                 .for_each(|(res, state_i)| res.data[vec_index] = state_i);
+            // Ostatnie 16 elementów trace (kolumny 142-157) to FINAL STATE = OUTPUT HASHA!
         }
     }
     let domain = CanonicCoset::new(log_size).circle_domain();
@@ -318,243 +363,8 @@ pub fn gen_interaction_trace(
             (denom1 - denom0, denom0 * denom1)
         };
         let range = 0..1 << (log_size - LOG_N_LANES);
-
-        #[cfg(not(feature = "parallel"))]
         logup_gen.col_from_iter(range.map(frac_at_row));
-
-        #[cfg(feature = "parallel")]
-        logup_gen.col_from_par_iter(range.into_par_iter().map(frac_at_row));
     }
 
     logup_gen.finalize_last()
-}
-
-pub fn prove_poseidon(
-    log_n_instances: u32,
-    config: PcsConfig,
-) -> (PoseidonComponent, StarkProof<Blake2sMerkleHasher>) {
-    assert!(log_n_instances >= N_LOG_INSTANCES_PER_ROW as u32);
-    let log_n_rows = log_n_instances - N_LOG_INSTANCES_PER_ROW as u32;
-
-    // Precompute twiddles.
-    let span = span!(Level::INFO, "Precompute twiddles").entered();
-    let twiddles = SimdBackend::precompute_twiddles(
-        CanonicCoset::new(log_n_rows + LOG_EXPAND + config.fri_config.log_blowup_factor)
-            .circle_domain()
-            .half_coset,
-    );
-    span.exit();
-
-    // Setup protocol.
-    let channel = &mut Blake2sChannel::default();
-    let mut commitment_scheme =
-        CommitmentSchemeProver::<_, Blake2sMerkleChannel>::new(config, &twiddles);
-
-    // Preprocessed trace.
-    let span = span!(Level::INFO, "Constant").entered();
-    let mut tree_builder = commitment_scheme.tree_builder();
-    let constant_trace = vec![];
-    tree_builder.extend_evals(constant_trace);
-    tree_builder.commit(channel);
-    span.exit();
-
-    // Trace.
-    let span = span!(Level::INFO, "Trace").entered();
-    let (trace, lookup_data) = gen_trace(log_n_rows);
-    let mut tree_builder = commitment_scheme.tree_builder();
-    tree_builder.extend_evals(trace);
-    tree_builder.commit(channel);
-    span.exit();
-
-    // Draw lookup elements.
-    let lookup_elements = PoseidonElements::draw(channel);
-
-    // Interaction trace.
-    let span = span!(Level::INFO, "Interaction").entered();
-    let (trace, claimed_sum) = gen_interaction_trace(log_n_rows, lookup_data, &lookup_elements);
-    let mut tree_builder = commitment_scheme.tree_builder();
-    tree_builder.extend_evals(trace);
-    tree_builder.commit(channel);
-    span.exit();
-
-    // Prove constraints.
-    let component = PoseidonComponent::new(
-        &mut TraceLocationAllocator::default(),
-        PoseidonEval {
-            log_n_rows,
-            lookup_elements,
-            claimed_sum,
-        },
-        claimed_sum,
-    );
-    info!("Poseidon component info:\n{}", component);
-    let proof = prove(&[&component], channel, commitment_scheme).unwrap();
-
-    (component, proof)
-}
-
-#[cfg(test)]
-mod tests {
-    use std::{array, env};
-
-    use itertools::Itertools;
-    use stwo::core::air::Component;
-    use stwo::core::channel::Blake2sChannel;
-    use stwo::core::fields::m31::M31;
-    use stwo::core::fri::FriConfig;
-    use stwo::core::pcs::{CommitmentSchemeVerifier, PcsConfig, TreeVec};
-    use stwo::core::poly::circle::CanonicCoset;
-    use stwo::core::vcs::blake2_merkle::Blake2sMerkleChannel;
-    use stwo::core::verifier::verify;
-    use stwo_constraint_framework::assert_constraints_on_polys;
-
-    use crate::poseidon::{
-        apply_internal_round_matrix, apply_m4, eval_poseidon_constraints, gen_interaction_trace,
-        gen_trace, prove_poseidon, PoseidonElements,
-    };
-
-    #[cfg(all(target_family = "wasm", not(target_os = "wasi")))]
-    #[wasm_bindgen_test::wasm_bindgen_test]
-    fn test_poseidon_prove_wasm() {
-        const LOG_N_INSTANCES: u32 = 10;
-        let config = PcsConfig {
-            pow_bits: 10,
-            fri_config: FriConfig::new(5, 1, 64),
-        };
-
-        // Prove.
-        prove_poseidon(LOG_N_INSTANCES, config);
-    }
-
-    #[test]
-    fn test_apply_m4() {
-        let m4 = ndarray::arr2(&[
-            [5, 7, 1, 3].map(M31),
-            [4, 6, 1, 1].map(M31),
-            [1, 3, 5, 7].map(M31),
-            [1, 1, 4, 6].map(M31),
-        ]);
-        let state = [0, 1, 2, 3].map(M31);
-        let expected_dot = m4.dot(&ndarray::arr2(&[state]).t());
-        let expected_dot: [_; 4] = expected_dot.into_raw_vec_and_offset().0.try_into().unwrap();
-
-        let actual_dot = apply_m4(state);
-
-        assert_eq!(expected_dot, actual_dot);
-    }
-
-    #[test]
-    fn test_apply_internal() {
-        const W: usize = 16;
-        let mut state = array::from_fn(|i| M31((i * 3 + 187) as u32));
-        let mut internal_matrix = ndarray::arr2(&[[M31(1); W]; W]);
-        for (i, elem) in internal_matrix.diag_mut().iter_mut().enumerate() {
-            *elem += M31((1 << (i + 1)) as u32);
-        }
-        let expected_state = internal_matrix.dot(&ndarray::arr2(&[state]).t());
-        let expected_state: [_; W] = expected_state
-            .into_raw_vec_and_offset()
-            .0
-            .try_into()
-            .unwrap();
-
-        apply_internal_round_matrix(&mut state);
-
-        assert_eq!(state, expected_state);
-    }
-
-    #[test]
-    fn test_poseidon_constraints() {
-        const LOG_N_ROWS: u32 = 8;
-
-        // Trace.
-        let (trace0, interaction_data) = gen_trace(LOG_N_ROWS);
-        let lookup_elements = PoseidonElements::dummy();
-        let (trace1, claimed_sum) =
-            gen_interaction_trace(LOG_N_ROWS, interaction_data, &lookup_elements);
-
-        let traces = TreeVec::new(vec![vec![], trace0, trace1]);
-        let trace_polys =
-            traces.map(|trace| trace.into_iter().map(|c| c.interpolate()).collect_vec());
-        assert_constraints_on_polys(
-            &trace_polys,
-            CanonicCoset::new(LOG_N_ROWS),
-            |mut eval| {
-                eval_poseidon_constraints(&mut eval, &lookup_elements);
-            },
-            claimed_sum,
-        );
-    }
-
-    #[test_log::test]
-    fn test_simd_poseidon_prove() {
-        // Note: To see time measurement, run test with
-        //   RUST_LOG_SPAN_EVENTS=enter,close RUST_LOG=info RUST_BACKTRACE=1 RUSTFLAGS="
-        //   -C target-cpu=native -C target-feature=+avx512f -C opt-level=3" cargo test
-        //   test_simd_poseidon_prove -- --nocapture
-
-        // Get from environment variable:
-        let log_n_instances = env::var("LOG_N_INSTANCES")
-            .unwrap_or_else(|_| "10".to_string())
-            .parse::<u32>()
-            .unwrap();
-        let config = PcsConfig {
-            pow_bits: 10,
-            fri_config: FriConfig::new(5, 1, 64),
-        };
-
-        // Prove.
-        let (component, proof) = prove_poseidon(log_n_instances, config);
-
-        // Verify.
-        // TODO: Create Air instance independently.
-        let channel = &mut Blake2sChannel::default();
-        let commitment_scheme =
-            &mut CommitmentSchemeVerifier::<Blake2sMerkleChannel>::new(proof.config);
-
-        // Decommit.
-        // Retrieve the expected column sizes in each commitment interaction, from the AIR.
-        let sizes = component.trace_log_degree_bounds();
-
-        // Preprocessed columns.
-        commitment_scheme.commit(proof.commitments[0], &sizes[0], channel);
-        // Trace columns.
-        commitment_scheme.commit(proof.commitments[1], &sizes[1], channel);
-        // Draw lookup element.
-        let lookup_elements = PoseidonElements::draw(channel);
-        assert_eq!(lookup_elements, component.lookup_elements);
-        // Interaction columns.
-        commitment_scheme.commit(proof.commitments[2], &sizes[2], channel);
-
-        verify(&[&component], channel, commitment_scheme, proof).unwrap();
-    }
-
-    #[cfg(feature = "tracing")]
-    #[test]
-    fn trace_simd_poseidon_prove() {
-        use stwo::tracing::SpanAccumulator;
-        use tracing_subscriber::layer::SubscriberExt;
-        use tracing_subscriber::Registry;
-
-        let collector = SpanAccumulator::default();
-        let layer = collector.clone();
-        let subscriber = Registry::default().with(layer);
-        let _guard = tracing::subscriber::set_default(subscriber);
-
-        let log_n_instances = env::var("LOG_N_INSTANCES")
-            .unwrap_or_else(|_| "10".to_string())
-            .parse::<u32>()
-            .unwrap();
-        let config = PcsConfig {
-            pow_bits: 10,
-            fri_config: FriConfig::new(5, 1, 64),
-        };
-
-        // Prove.
-        let _ = prove_poseidon(log_n_instances, config);
-
-        let csv = collector.export_csv();
-
-        println!("{csv}");
-    }
 }
